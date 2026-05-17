@@ -1,0 +1,24 @@
+{
+  "name": "utils",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/nekeinno/utils#readme",
+  "bugs": {
+    "url": "https://github.com/nekeinno/utils/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nekeinno/utils.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "wake-desktop": "node --env-file=.env wake-desktop.js"
+  },
+  "dependencies": {
+    "ping": "^0.4.4",
+    "wakeonlan": "^0.1.0"
+  }
+}

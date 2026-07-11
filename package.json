@@ -13,11 +13,18 @@
   "license": "ISC",
   "author": "",
   "type": "commonjs",
-  "main": "index.js",
+  "main": "src/backup/backup.js",
+  "engines": {
+    "node": ">=20.6.0"
+  },
   "scripts": {
-    "wake-desktop": "node --env-file=.env wake-desktop.js"
+    "wake-desktop": "node --env-file=.env src/wake-desktop/wake-desktop.js",
+    "backup": "node src/backup/backup.js",
+    "test": "node --test",
+    "test:backup:coverage": "node --test --experimental-test-coverage --test-coverage-include=src/backup/backup.js test/backup/backup.test.js"
   },
   "dependencies": {
+    "archiver": "^7.0.1",
     "ping": "^0.4.4",
     "wakeonlan": "^0.1.0"
   }

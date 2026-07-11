@@ -1,0 +1,8 @@
+{
+  "sourceDirectory": "./Documents",
+  "targetDirectories": [
+    "/a/b/c",
+    "/x/y/z"
+  ],
+  "outputDirectory": "./generated-backups"
+}

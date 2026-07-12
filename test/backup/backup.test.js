@@ -15,13 +15,18 @@ const {
   InterruptedError,
   OperationContext,
   acquireDirectoryLocks,
+  acquireRunLock,
   assertDirectoryUnchanged,
   backupFilename,
+  backupFilenamePattern,
   cleanupStartupArtifacts,
   copyAtomically,
   createArchive,
   execute,
+  formatBytes,
+  measureDirectoryStorage,
   readAndValidate,
+  resolveRunLockPath,
   shortTempPath,
 } = require('../../src/backup/backup');
 
@@ -62,10 +67,11 @@ function successfulArchiveFactory(contents = 'zip-data') {
   };
 }
 
-async function runCli(t, args, input = '') {
+async function runCli(t, args, input = '', environment = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   const child = spawn(process.execPath, [SCRIPT, ...args], {
+    env: { ...process.env, ...environment },
     stdio: ['pipe', 'pipe', 'pipe'],
     signal: controller.signal,
   });
@@ -105,6 +111,78 @@ test('backupFilename truncates long UTF-8 names on character boundaries with a s
   assert(Buffer.byteLength(first) <= 255);
   assert.match(first, /-[0-9a-f]{12}_Backup_July112026\.zip$/);
   assert(!first.includes('�'));
+});
+
+test('backupFilenamePattern matches every filename produced by the backup naming scheme', () => {
+  const pattern = backupFilenamePattern();
+
+  assert(pattern.test('Project.[1]_Backup_January012024.zip'));
+  assert(pattern.test('Project.[1]_Backup_December312099.zip'));
+  assert(pattern.test('Other_Backup_January012024.zip'));
+  assert(pattern.test('long-name-a1b2c3d4e5f6_Backup_March032024.zip'));
+  assert(!pattern.test('_Backup_January012024.zip'));
+  assert(!pattern.test('Project.[1]_Backup_January322024.zip'));
+  assert(!pattern.test('Project.[1]_Backup_Jan012024.zip'));
+  assert(!pattern.test('Project.[1]_Backup_January012024.zip.tmp'));
+});
+
+test('measureDirectoryStorage totals nested files but counts matching backups at the target root', async (t) => {
+  const root = await temporaryRoot(t);
+  const nested = path.join(root, 'nested');
+  await fsp.mkdir(nested);
+  await Promise.all([
+    fsp.writeFile(path.join(root, 'other-source_Backup_January012025.zip'), 'backup'),
+    fsp.writeFile(path.join(root, 'another-file.zip'), 'other'),
+    fsp.writeFile(path.join(nested, 'source_Backup_February022025.zip'), 'nested backup'),
+  ]);
+  const directory = await directoryDetails(root, 'targetDirectories[0]');
+
+  const storage = await measureDirectoryStorage(
+    directory,
+    backupFilenamePattern(),
+  );
+
+  assert.deepEqual(storage, { totalBytes: 24n, backupBytes: 6n, backupCount: 1 });
+});
+
+test('measureDirectoryStorage stats entries when directory types are unknown', async (t) => {
+  const root = await temporaryRoot(t);
+  const nested = path.join(root, 'nested');
+  await fsp.mkdir(nested);
+  await Promise.all([
+    fsp.writeFile(path.join(root, 'source_Backup_January012025.zip'), 'backup'),
+    fsp.writeFile(path.join(root, 'another-file.zip'), 'other'),
+    fsp.writeFile(path.join(nested, 'contents.txt'), 'nested contents'),
+  ]);
+  await fsp.symlink(path.join(root, 'another-file.zip'), path.join(root, 'file-link'));
+  const directory = await directoryDetails(root, 'targetDirectories[0]');
+  const originalReaddir = fsp.readdir;
+  t.mock.method(fsp, 'readdir', async (...args) => {
+    const entries = await originalReaddir(...args);
+    if (!args[1]?.withFileTypes) return entries;
+    return entries.map((entry) => ({
+      name: entry.name,
+      isFile: () => false,
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+      isBlockDevice: () => false,
+      isCharacterDevice: () => false,
+      isFIFO: () => false,
+      isSocket: () => false,
+    }));
+  });
+
+  const storage = await measureDirectoryStorage(directory, backupFilenamePattern());
+
+  assert.deepEqual(storage, { totalBytes: 26n, backupBytes: 6n, backupCount: 1 });
+});
+
+test('formatBytes presents byte counts with binary units', () => {
+  assert.equal(formatBytes(0n), '0 B');
+  assert.equal(formatBytes(1023n), '1023 B');
+  assert.equal(formatBytes(1024n), '1.00 KiB');
+  assert.equal(formatBytes(1536n), '1.50 KiB');
+  assert.equal(formatBytes(1024n ** 3n), '1.00 GiB');
 });
 
 test('shortTempPath stays in its directory and uses the owned-artifact shape', () => {
@@ -168,6 +246,12 @@ test('readAndValidate resolves relative paths and plans aliases without duplicat
   assert.match(plan.previewTargets[0].action, /shared with outputDirectory/);
   assert.equal(plan.previewTargets[1].action, 'will be overwritten');
   assert.match(plan.previewTargets[2].action, /shared with targetDirectories\[1\]/);
+  assert.deepEqual(plan.previewTargets[1].storage, {
+    totalBytes: BigInt(Buffer.byteLength('old backup')),
+    backupBytes: BigInt(Buffer.byteLength('old backup')),
+    backupCount: 1,
+  });
+  assert.equal(plan.previewTargets[1].storage, plan.previewTargets[2].storage);
 });
 
 test('readAndValidate recognizes an existing retained archive', async (t) => {
@@ -244,19 +328,19 @@ test('assertDirectoryUnchanged detects a replaced configured symlink', async (t)
   await assert.rejects(assertDirectoryUnchanged(directory), /no longer identifies the directory validated earlier/);
 });
 
-test('cleanupStartupArtifacts removes only owned regular temporary files', async (t) => {
+test('cleanupStartupArtifacts removes only current archive and copy temporary files', async (t) => {
   const root = await temporaryRoot(t);
   const output = await directoryDetails(root, 'outputDirectory');
   const ownedArchive = path.join(root, '.backup-archive-12345678-1234-4abc-8def-123456789abc.tmp');
   const ownedCopy = path.join(root, '.backup-copy-abcdefab-cdef-4abc-9def-abcdefabcdef.tmp');
-  const ownedLockMetadata = path.join(root, '.backup-lock-fedcbafe-dcba-4321-abcd-fedcbafedcba.tmp');
+  const legacyLockMetadata = path.join(root, '.backup-lock-fedcbafe-dcba-4321-abcd-fedcbafedcba.tmp');
   const broadLookalike = path.join(root, '.backup-copy-a.tmp');
   const unrelated = path.join(root, '.backup-other-abcdef.tmp');
   const lookalikeDirectory = path.join(root, '.backup-copy-directory.tmp');
   await Promise.all([
     fsp.writeFile(ownedArchive, 'stale'),
     fsp.writeFile(ownedCopy, 'stale'),
-    fsp.writeFile(ownedLockMetadata, 'stale'),
+    fsp.writeFile(legacyLockMetadata, 'keep'),
     fsp.writeFile(broadLookalike, 'keep'),
     fsp.writeFile(unrelated, 'keep'),
     fsp.mkdir(lookalikeDirectory),
@@ -266,6 +350,7 @@ test('cleanupStartupArtifacts removes only owned regular temporary files', async
 
   assert.deepEqual((await fsp.readdir(root)).sort(), [
     path.basename(broadLookalike),
+    path.basename(legacyLockMetadata),
     path.basename(unrelated),
     path.basename(lookalikeDirectory),
   ].sort());
@@ -527,117 +612,105 @@ test('execute classifies copy failures and always removes a staging-only archive
   assert.deepEqual(await context.cleanup(), []);
 });
 
-test('lock acquisition rolls back earlier locks if a later directory is busy', async (t) => {
+test('execute preserves a copy failure when staging cleanup also fails', async (t) => {
   const root = await temporaryRoot(t);
-  const directories = await makeDirectories(root, ['a-first', 'z-second']);
-  const first = directories['a-first'];
-  const second = directories['z-second'];
-  const output = await directoryDetails(first, 'outputDirectory');
-  const target = await directoryDetails(second, 'targetDirectories[0]');
-  const busyLock = path.join(second, '.backup.lock');
-  await fsp.writeFile(busyLock, JSON.stringify({ pid: process.pid, hostname: os.hostname(), token: 'busy' }));
-
-  await assert.rejects(acquireDirectoryLocks({ output, targets: [target] }), /Another backup run owns/);
-
-  await assert.rejects(fsp.access(path.join(first, '.backup.lock')), { code: 'ENOENT' });
-  assert.equal(JSON.parse(await fsp.readFile(busyLock, 'utf8')).token, 'busy');
-});
-
-test('directory locks reject source and writable-directory hierarchy overlaps across runs', async (t) => {
-  const root = await temporaryRoot(t);
-  const directories = await makeDirectories(root, ['tree', 'first-output', 'second-output']);
-  const { tree } = directories;
-  const firstOutput = directories['first-output'];
-  const secondOutput = directories['second-output'];
-  const nested = path.join(tree, 'nested');
-  await fsp.mkdir(nested);
-  const treeDetails = await directoryDetails(tree, 'sourceDirectory');
-  const nestedDetails = await directoryDetails(nested, 'targetDirectories[0]');
-  const firstOutputDetails = await directoryDetails(firstOutput, 'outputDirectory');
-  const secondOutputDetails = await directoryDetails(secondOutput, 'outputDirectory');
-  const first = await acquireDirectoryLocks({ source: treeDetails, output: firstOutputDetails, targets: [] });
+  const { source: sourcePath, output: outputPath, target: targetPath } =
+    await makeDirectories(root, ['source', 'output', 'target']);
+  const source = await directoryDetails(sourcePath, 'sourceDirectory');
+  const output = await directoryDetails(outputPath, 'outputDirectory');
+  const target = await directoryDetails(targetPath, 'targetDirectories[0]');
+  const context = new OperationContext();
+  const plan = {
+    source,
+    output,
+    targets: [target],
+    archivePath: path.join(outputPath, 'backup.zip'),
+    retainArchive: false,
+    copyTargets: [{ directory: target, destination: path.join(targetPath, 'backup.zip') }],
+  };
 
   await assert.rejects(
-    acquireDirectoryLocks({ output: secondOutputDetails, targets: [nestedDetails] }),
-    /overlapping directory/,
+    execute(plan, context, {
+      archive: { archiveFactory: successfulArchiveFactory() },
+      copy: { createReadStream: () => new Readable({ read() { this.destroy(new Error('copy failed')); } }) },
+      removeFile: async () => { throw new Error('cleanup failed'); },
+    }),
+    (error) => error.exitCode === EXIT.COPY &&
+      /Failed to copy archive.*copy failed.*Cleanup also failed.*cleanup failed/.test(error.message),
   );
+  assert.equal(context.temporaryPaths.size, 2);
+  assert.deepEqual(await context.cleanup(), []);
+});
 
+test('run lock rejects a second active backup and releases cleanly', async (t) => {
+  const root = await temporaryRoot(t);
+  const lockPath = path.join(root, '.backup-tool.lock');
+
+  const first = await acquireRunLock(lockPath);
+  await assert.rejects(acquireRunLock(lockPath), /Another backup run may already be active/);
   assert.deepEqual(await first.release(), []);
-  const writer = await acquireDirectoryLocks({ output: firstOutputDetails, targets: [treeDetails] });
-  await assert.rejects(
-    acquireDirectoryLocks({ source: nestedDetails, output: secondOutputDetails, targets: [] }),
-    /overlapping directory/,
+  await assert.rejects(fsp.access(lockPath), { code: 'ENOENT' });
+});
+
+test('run lock path uses the home directory independently of TMPDIR', () => {
+  assert.equal(
+    resolveRunLockPath({ TMPDIR: '/different-temporary-directory' }, '/user-owned-home'),
+    path.join('/user-owned-home', '.backup-tool.lock'),
   );
-  assert.deepEqual(await writer.release(), []);
 });
 
-test('directory locks allow overlapping read-only source trees', async (t) => {
-  const root = await temporaryRoot(t);
-  const directories = await makeDirectories(root, ['tree', 'first-output', 'second-output']);
-  const { tree } = directories;
-  const firstOutput = directories['first-output'];
-  const secondOutput = directories['second-output'];
-  const nested = path.join(tree, 'nested');
-  await fsp.mkdir(nested);
-  const first = await acquireDirectoryLocks({
-    source: await directoryDetails(tree, 'sourceDirectory'),
-    output: await directoryDetails(firstOutput, 'outputDirectory'),
-    targets: [],
-  });
-  const second = await acquireDirectoryLocks({
-    source: await directoryDetails(nested, 'sourceDirectory'),
-    output: await directoryDetails(secondOutput, 'outputDirectory'),
-    targets: [],
-  });
-
-  assert.deepEqual(await second.release(), []);
-  assert.deepEqual(await first.release(), []);
+test('run lock path honors an absolute override and rejects a relative override', () => {
+  const absolute = path.resolve('/test-locks', '.backup-tool.lock');
+  assert.equal(resolveRunLockPath({ BACKUP_LOCK_PATH: absolute }, '/unused-home'), absolute);
+  assert.throws(
+    () => resolveRunLockPath({ BACKUP_LOCK_PATH: 'relative.lock' }, '/unused-home'),
+    /BACKUP_LOCK_PATH must be an absolute path/,
+  );
 });
 
-test('directory locks reject a live owner and replace an abandoned owner', async (t) => {
+test('resolved singleton lock paths conflict and the compatibility export is releasable', async (t) => {
   const root = await temporaryRoot(t);
-  const output = await directoryDetails(root, 'outputDirectory');
-  const plan = { output, targets: [] };
+  const lockPath = path.join(root, '.backup-tool.lock');
+  const resolved = resolveRunLockPath({ BACKUP_LOCK_PATH: lockPath }, '/unused-home');
+  const first = await acquireRunLock(resolved);
 
-  const first = await acquireDirectoryLocks(plan);
-  await assert.rejects(acquireDirectoryLocks(plan), /Another backup run owns/);
+  await assert.rejects(acquireRunLock(resolved), /Another backup run may already be active/);
   assert.deepEqual(await first.release(), []);
 
-  const lockPath = path.join(root, '.backup.lock');
-  await fsp.writeFile(lockPath, JSON.stringify({
-    pid: 99_999_999,
-    hostname: os.hostname(),
-    token: 'abandoned',
-  }));
-  const replacement = await acquireDirectoryLocks(plan);
-  assert.notEqual(JSON.parse(await fsp.readFile(lockPath, 'utf8')).token, 'abandoned');
-  assert.deepEqual(await replacement.release(), []);
-});
-
-test('directory locks reclaim empty and truncated legacy lock files', async (t) => {
-  const root = await temporaryRoot(t);
-  const output = await directoryDetails(root, 'outputDirectory');
-  const plan = { output, targets: [] };
-  const lockPath = path.join(root, '.backup.lock');
-
-  for (const contents of ['', '{"pid":']) {
-    await fsp.writeFile(lockPath, contents);
-    const locks = await acquireDirectoryLocks(plan);
-    const owner = JSON.parse(await fsp.readFile(lockPath, 'utf8'));
-    assert.equal(owner.pid, process.pid);
-    assert.equal(owner.hostname, os.hostname());
-    assert.deepEqual(await locks.release(), []);
+  const originalLockPath = process.env.BACKUP_LOCK_PATH;
+  process.env.BACKUP_LOCK_PATH = lockPath;
+  try {
+    const compatible = await acquireDirectoryLocks({ ignored: true });
+    assert.equal(typeof compatible.release, 'function');
+    assert.equal(typeof compatible.releaseSync, 'function');
+    assert.deepEqual(await compatible.release(), []);
+  } finally {
+    if (originalLockPath === undefined) delete process.env.BACKUP_LOCK_PATH;
+    else process.env.BACKUP_LOCK_PATH = originalLockPath;
   }
 });
 
-test('lock release does not delete a lock whose ownership token changed', async (t) => {
+test('run lock leaves stale ownership decisions to the local operator', async (t) => {
   const root = await temporaryRoot(t);
-  const output = await directoryDetails(root, 'outputDirectory');
-  const locks = await acquireDirectoryLocks({ output, targets: [] });
-  const lockPath = path.join(root, '.backup.lock');
+  const lockPath = path.join(root, '.backup-tool.lock');
+  const staleOwner = JSON.stringify({
+    pid: 99_999_999,
+    hostname: os.hostname(),
+    token: 'abandoned',
+  });
+  await fsp.writeFile(lockPath, staleOwner);
+
+  await assert.rejects(acquireRunLock(lockPath), /inspect and remove this stale lock manually/);
+  assert.equal(await fsp.readFile(lockPath, 'utf8'), staleOwner);
+});
+
+test('run lock release does not delete a lock whose ownership token changed', async (t) => {
+  const root = await temporaryRoot(t);
+  const lockPath = path.join(root, '.backup-tool.lock');
+  const lock = await acquireRunLock(lockPath);
   await fsp.writeFile(lockPath, JSON.stringify({ pid: process.pid, hostname: os.hostname(), token: 'replacement' }));
 
-  assert.deepEqual(await locks.release(), []);
+  assert.deepEqual(await lock.release(), []);
   assert.equal(JSON.parse(await fsp.readFile(lockPath, 'utf8')).token, 'replacement');
 });
 
@@ -655,11 +728,33 @@ test('CLI returns usage and validation exit codes with actionable errors', async
   assert.match(validation.stderr, /"sourceDirectory" is required/);
 });
 
+test('CLI rejects a relative BACKUP_LOCK_PATH before creating a lock', async (t) => {
+  const root = await temporaryRoot(t, 'backup-cli-lock-validation-');
+  const { source, output } = await makeDirectories(root, ['source', 'output']);
+  const config = path.join(root, 'config.json');
+  await fsp.writeFile(config, JSON.stringify({
+    sourceDirectory: source,
+    outputDirectory: output,
+    targetDirectories: [output],
+  }));
+
+  const result = await runCli(t, [config], 'yes\n', { BACKUP_LOCK_PATH: 'relative.lock' });
+
+  assert.equal(result.exitCode, EXIT.VALIDATION);
+  assert.match(result.stderr, /BACKUP_LOCK_PATH must be an absolute path/);
+  assert.deepEqual(await fsp.readdir(output), []);
+});
+
 test('CLI cancellation leaves backup directories untouched', async (t) => {
   const root = await temporaryRoot(t, 'backup-cli-cancel-');
   const { source, output, target } = await makeDirectories(root, ['source', 'output', 'target']);
   const existingTemporary = path.join(target, '.backup-copy-00000000-0000-4000-8000-000000000000.tmp');
   await fsp.writeFile(existingTemporary, 'must remain untouched');
+  await fsp.writeFile(path.join(target, 'source_Backup_January012025.zip'), '1234567890');
+  await fsp.writeFile(path.join(target, 'unrelated.txt'), 'abc');
+  const nested = path.join(target, 'nested');
+  await fsp.mkdir(nested);
+  await fsp.writeFile(path.join(nested, 'contents.txt'), 'hello');
   const config = path.join(root, 'config.json');
   await fsp.writeFile(config, JSON.stringify({
     sourceDirectory: source,
@@ -670,10 +765,17 @@ test('CLI cancellation leaves backup directories untouched', async (t) => {
   const result = await runCli(t, [config], 'n\n');
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.match(result.stdout, /Backup cancelled; no files were changed\./);
+  assert.match(result.stdout, /Targets \(1\)\n-----------\n1\. .*source_Backup_.*\.zip\n   Action             will be created/);
+  assert.match(result.stdout, /Existing contents  39 B\n   Matching backups   10 B in 1 backup/);
+  assert.match(result.stdout, /Proceed\? \[y\/N\] \nCANCELLED — No files were changed\./);
   assert.equal(await fsp.readFile(existingTemporary, 'utf8'), 'must remain untouched');
   assert.deepEqual(await fsp.readdir(output), []);
-  assert.deepEqual(await fsp.readdir(target), [path.basename(existingTemporary)]);
+  assert.deepEqual((await fsp.readdir(target)).sort(), [
+    path.basename(existingTemporary),
+    'nested',
+    'source_Backup_January012025.zip',
+    'unrelated.txt',
+  ].sort());
 });
 
 test('CLI creates a real ZIP, reports completion, and releases its lock', async (t) => {
@@ -687,11 +789,13 @@ test('CLI creates a real ZIP, reports completion, and releases its lock', async 
     targetDirectories: [output],
   }));
 
-  const result = await runCli(t, [config], 'yes\n');
+  const lockPath = path.join(root, '.backup-tool.lock');
+  const result = await runCli(t, [config], 'yes\n', { BACKUP_LOCK_PATH: lockPath });
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.match(result.stdout, /Backup execution preview/);
-  assert.match(result.stdout, /Backup complete:/);
+  assert.match(result.stdout, /Backup preview\n==============/);
+  assert.match(result.stdout, /Backup complete\n===============/);
+  assert.match(result.stdout, /Replicated copies \(0\)/);
   const entries = await fsp.readdir(output);
   assert.equal(entries.length, 1);
   assert.match(entries[0], /^source_Backup_[A-Z][a-z]+\d{2}\d{4}\.zip$/);
@@ -700,4 +804,5 @@ test('CLI creates a real ZIP, reports completion, and releases its lock', async 
   await handle.read(header, 0, 4, 0);
   await handle.close();
   assert.equal(header.toString('hex'), '504b0304');
+  await assert.rejects(fsp.access(lockPath), { code: 'ENOENT' });
 });

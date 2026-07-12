@@ -18,11 +18,12 @@ const EXIT = Object.freeze({
   INTERRUPTED: 130,
 });
 const MAX_FILENAME_BYTES = 255;
+const BACKUP_MONTH_PATTERN = '(?:January|February|March|April|May|June|July|August|September|October|November|December)';
 const UUID_V4_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-const TEMPORARY_FILE_PATTERN = new RegExp(`^\\.backup-(?:archive|copy|lock)-${UUID_V4_PATTERN}\\.tmp$`, 'i');
-const LOCK_FILENAME = '.backup.lock';
-const LOCK_REGISTRY_DIRECTORY = path.join(os.tmpdir(), '.backup-directory-locks-v1');
-const LOCK_REGISTRY_MUTEX = '.registry.lock';
+const TEMPORARY_FILE_PATTERN = new RegExp(`^\\.backup-(?:archive|copy)-${UUID_V4_PATTERN}\\.tmp$`, 'i');
+const RUN_LOCK_FILENAME = '.backup-tool.lock';
+const INDENT_PREFIX = '  ';
+const LIST_DETAIL_PREFIX = '   ';
 
 class InterruptedError extends Error {
   constructor(signal = 'SIGINT') {
@@ -75,8 +76,10 @@ async function validateDirectory(configuredPath, label, accessMode) {
   try {
     await fsp.access(canonicalPath, accessMode);
   } catch (error) {
-    const requirement = accessMode & fs.constants.W_OK
-      ? 'writable and searchable so files can be created and renamed'
+    const requirement = accessMode & fs.constants.W_OK && accessMode & fs.constants.R_OK
+      ? 'readable, writable, and searchable so storage can be measured and files can be created and renamed'
+      : accessMode & fs.constants.W_OK
+        ? 'writable and searchable so files can be created and renamed'
       : 'readable and searchable so its contents can be enumerated';
     throw new Error(`${label} must be ${requirement}: ${configuredPath} (${error.code || error.message})`);
   }
@@ -135,6 +138,87 @@ function backupFilename(sourceDirectory, now = new Date()) {
   return `${truncateUtf8(name, prefixBudget)}${marker}${suffix}`;
 }
 
+function backupFilenamePattern() {
+  return new RegExp(`^.+_Backup_${BACKUP_MONTH_PATTERN}(?:0[1-9]|[12][0-9]|3[01])[0-9]{4}\\.zip$`);
+}
+
+function direntTypeIsUnknown(entry) {
+  return !entry.isFile() &&
+    !entry.isDirectory() &&
+    !entry.isSymbolicLink() &&
+    !entry.isBlockDevice() &&
+    !entry.isCharacterDevice() &&
+    !entry.isFIFO() &&
+    !entry.isSocket();
+}
+
+async function measureDirectoryStorage(directory, backupPattern) {
+  let totalBytes = 0n;
+  let backupBytes = 0n;
+  let backupCount = 0;
+
+  async function visit(currentDirectory, countBackups) {
+    let entries;
+    try {
+      entries = await fsp.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`Cannot measure storage used in ${directory.label}: ${directory.configuredPath} (${error.code || error.message})`);
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      let isDirectory = entry.isDirectory();
+      let isFile = entry.isFile();
+      let details;
+
+      if (!isDirectory && !isFile && direntTypeIsUnknown(entry)) {
+        try {
+          details = await fsp.lstat(entryPath, { bigint: true });
+        } catch (error) {
+          throw new Error(`Cannot inspect entry ${entryPath}: ${error.code || error.message}`);
+        }
+        isDirectory = details.isDirectory();
+        isFile = details.isFile();
+      }
+
+      if (isDirectory) {
+        await visit(entryPath, false);
+        continue;
+      }
+      if (!isFile) continue;
+
+      if (!details) {
+        try {
+          details = await fsp.stat(entryPath, { bigint: true });
+        } catch (error) {
+          throw new Error(`Cannot measure file ${entryPath}: ${error.code || error.message}`);
+        }
+      }
+      totalBytes += details.size;
+      if (countBackups && backupPattern.test(entry.name)) {
+        backupBytes += details.size;
+        backupCount += 1;
+      }
+    }
+  }
+
+  await visit(directory.canonicalPath, true);
+  return { totalBytes, backupBytes, backupCount };
+}
+
+function formatBytes(bytes) {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let divisor = 1n;
+  let unitIndex = 0;
+  while (unitIndex < units.length - 1 && bytes >= divisor * 1024n) {
+    divisor *= 1024n;
+    unitIndex += 1;
+  }
+  if (unitIndex === 0) return `${bytes} B`;
+  const hundredths = (bytes * 100n + divisor / 2n) / divisor;
+  return `${hundredths / 100n}.${String(hundredths % 100n).padStart(2, '0')} ${units[unitIndex]}`;
+}
+
 async function pathKind(destination, label) {
   try {
     const details = await fsp.stat(destination);
@@ -183,7 +267,7 @@ async function readAndValidate(configPath, now = new Date()) {
   const source = await validateDirectory(sourceConfigured, 'sourceDirectory', fs.constants.R_OK | fs.constants.X_OK);
   const output = await validateDirectory(outputConfigured, 'outputDirectory', fs.constants.W_OK | fs.constants.X_OK);
   const targets = await Promise.all(targetConfigured.map((directory, index) =>
-    validateDirectory(directory, `targetDirectories[${index}]`, fs.constants.W_OK | fs.constants.X_OK)));
+    validateDirectory(directory, `targetDirectories[${index}]`, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK)));
 
   if (isWithin(source.canonicalPath, output.canonicalPath)) {
     throw new Error(`outputDirectory must not resolve to sourceDirectory or one of its subdirectories: ${output.configuredPath} -> ${output.canonicalPath}`);
@@ -195,22 +279,29 @@ async function readAndValidate(configPath, now = new Date()) {
   }
 
   const filename = backupFilename(source.canonicalPath, now);
+  const filenamePattern = backupFilenamePattern();
   const archivePath = path.join(output.canonicalPath, filename);
   const retainArchive = targets.some((target) => target.identity === output.identity);
   const archiveExists = retainArchive ? await pathKind(archivePath, 'Archive output path') : false;
   const seen = new Map([[output.identity, 'outputDirectory']]);
   const previewTargets = [];
   const copyTargets = [];
+  const storageByIdentity = new Map();
   for (const target of targets) {
     const destination = path.join(target.canonicalPath, filename);
+    let storage = storageByIdentity.get(target.identity);
+    if (!storage) {
+      storage = await measureDirectoryStorage(target, filenamePattern);
+      storageByIdentity.set(target.identity, storage);
+    }
     const sharedWith = seen.get(target.identity);
     if (sharedWith) {
-      previewTargets.push({ directory: target, destination, action: `shared with ${sharedWith}; no additional copy` });
+      previewTargets.push({ directory: target, destination, action: `shared with ${sharedWith}; no additional copy`, storage });
       continue;
     }
     seen.set(target.identity, target.label);
     const exists = await pathKind(destination, 'Destination');
-    const item = { directory: target, destination, action: exists ? 'will be overwritten' : 'will be created' };
+    const item = { directory: target, destination, action: exists ? 'will be overwritten' : 'will be created', storage };
     previewTargets.push(item);
     copyTargets.push(item);
   }
@@ -223,23 +314,40 @@ function shortTempPath(directory, kind = 'work') {
 }
 
 function printPreview(plan) {
-  console.log('Backup execution preview');
-  console.log(`  Source: ${plan.source.canonicalPath}`);
-  console.log(`  ZIP filename: ${plan.filename}`);
+  console.log('Backup preview');
+  console.log('==============');
+  console.log('');
+  console.log('Source');
+  console.log(`${INDENT_PREFIX}${plan.source.canonicalPath}`);
+  console.log('');
+  console.log('Archive');
+  console.log(`${INDENT_PREFIX}Filename    ${plan.filename}`);
   if (plan.retainArchive) {
-    console.log(`  Archive output: ${plan.archivePath} — ${plan.archiveExists ? 'will be overwritten' : 'will be created'}`);
+    console.log(`${INDENT_PREFIX}Destination ${plan.archivePath}`);
+    console.log(`${INDENT_PREFIX}Action      ${plan.archiveExists ? 'Overwrite existing file' : 'Create new file'}`);
   } else {
-    console.log(`  Archive output: temporary staging in ${plan.output.canonicalPath}; removed after replication`);
+    console.log(`${INDENT_PREFIX}Staging     ${plan.output.canonicalPath}`);
+    console.log(`${INDENT_PREFIX}After run   Remove staging archive after replication`);
   }
-  console.log('  Targets:');
-  for (const target of plan.previewTargets) console.log(`    ${target.destination} — ${target.action}`);
+  console.log('');
+  const targetsHeading = `Targets (${plan.previewTargets.length})`;
+  console.log(targetsHeading);
+  console.log('-'.repeat(targetsHeading.length));
+  plan.previewTargets.forEach((target, index) => {
+    console.log(`${index + 1}. ${target.destination}`);
+    console.log(`${LIST_DETAIL_PREFIX}Action             ${target.action}`);
+    const backupLabel = target.storage.backupCount === 1 ? 'backup' : 'backups';
+    console.log(`${LIST_DETAIL_PREFIX}Existing contents  ${formatBytes(target.storage.totalBytes)}`);
+    console.log(`${LIST_DETAIL_PREFIX}Matching backups   ${formatBytes(target.storage.backupBytes)} in ${target.storage.backupCount} ${backupLabel}`);
+    if (index < plan.previewTargets.length - 1) console.log('');
+  });
 }
 
 async function confirmExecution(context) {
   const prompt = readline.createInterface({ input: process.stdin, output: process.stdout });
   const unregister = context.onAbort(() => prompt.close());
   try {
-    process.stdout.write('Proceed? [y/N] ');
+    process.stdout.write('\nProceed? [y/N] ');
     for await (const answer of prompt) {
       const response = answer.trim();
       context.throwIfInterrupted();
@@ -315,256 +423,74 @@ class OperationContext {
   }
 }
 
-function processIsRunning(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === 'EPERM';
-  }
-}
-
-async function lockIsAbandoned(lockPath) {
-  let owner;
-  try {
-    owner = JSON.parse(await fsp.readFile(lockPath, 'utf8'));
-  } catch (error) {
-    if (error.code === 'ENOENT') return true;
-    if (error instanceof SyntaxError) return true;
-    return false;
-  }
-  if (!owner || owner.hostname !== os.hostname() || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
-    return false;
-  }
-  return !processIsRunning(owner.pid);
-}
-
-async function removeAbandonedLock(lockPath) {
-  const claimPath = `${lockPath}.${crypto.randomUUID()}.stale`;
-  try {
-    await fsp.link(lockPath, claimPath);
-    const [lockDetails, claimDetails] = await Promise.all([fsp.stat(lockPath), fsp.stat(claimPath)]);
-    if (lockDetails.dev !== claimDetails.dev || lockDetails.ino !== claimDetails.ino) return false;
-    await fsp.unlink(lockPath);
-    return true;
-  } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'EEXIST') return false;
-    throw error;
-  } finally {
-    await fsp.rm(claimPath, { force: true }).catch(() => {});
-  }
-}
-
-class DirectoryLocks {
-  constructor(locks, token, registryClaimPath = null) {
-    this.locks = locks;
+class RunLock {
+  constructor(lockPath, token) {
+    this.lockPath = lockPath;
     this.token = token;
-    this.registryClaimPath = registryClaimPath;
+    this.held = true;
   }
 
   async release() {
-    const failures = [];
-    for (const lockPath of [...this.locks].reverse()) {
-      try {
-        const owner = JSON.parse(await fsp.readFile(lockPath, 'utf8'));
-        if (owner.token === this.token) await fsp.unlink(lockPath);
-        this.locks.delete(lockPath);
-      } catch (error) {
-        if (error.code === 'ENOENT') this.locks.delete(lockPath);
-        else failures.push({ path: lockPath, error });
+    if (!this.held) return [];
+    try {
+      const owner = JSON.parse(await fsp.readFile(this.lockPath, 'utf8'));
+      if (owner.token === this.token) await fsp.unlink(this.lockPath);
+      this.held = false;
+      return [];
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        this.held = false;
+        return [];
       }
+      return [{ path: this.lockPath, error }];
     }
-    if (this.registryClaimPath) {
-      try {
-        const owner = JSON.parse(await fsp.readFile(this.registryClaimPath, 'utf8'));
-        if (owner.token === this.token) await fsp.unlink(this.registryClaimPath);
-        this.registryClaimPath = null;
-      } catch (error) {
-        if (error.code === 'ENOENT') this.registryClaimPath = null;
-        else failures.push({ path: this.registryClaimPath, error });
-      }
-    }
-    return failures;
   }
 
   releaseSync() {
-    const failures = [];
-    for (const lockPath of [...this.locks].reverse()) {
-      try {
-        const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-        if (owner.token === this.token) fs.unlinkSync(lockPath);
-        this.locks.delete(lockPath);
-      } catch (error) {
-        if (error.code === 'ENOENT') this.locks.delete(lockPath);
-        else failures.push({ path: lockPath, error });
-      }
-    }
-    if (this.registryClaimPath) {
-      try {
-        const owner = JSON.parse(fs.readFileSync(this.registryClaimPath, 'utf8'));
-        if (owner.token === this.token) fs.unlinkSync(this.registryClaimPath);
-        this.registryClaimPath = null;
-      } catch (error) {
-        if (error.code === 'ENOENT') this.registryClaimPath = null;
-        else failures.push({ path: this.registryClaimPath, error });
-      }
-    }
-    return failures;
-  }
-}
-
-function pathsOverlap(left, right) {
-  return isWithin(left, right) || isWithin(right, left);
-}
-
-function lockClaims(plan) {
-  const claims = [];
-  if (plan.source) claims.push({ access: 'source', path: plan.source.canonicalPath, label: plan.source.label });
-  const writable = new Map();
-  for (const directory of [plan.output, ...plan.targets]) writable.set(directory.identity, directory);
-  for (const directory of writable.values()) {
-    claims.push({ access: 'write', path: directory.canonicalPath, label: directory.label });
-  }
-  return claims;
-}
-
-function conflictingClaims(leftClaims, rightClaims) {
-  for (const left of leftClaims) {
-    for (const right of rightClaims) {
-      if ((left.access === 'write' || right.access === 'write') && pathsOverlap(left.path, right.path)) {
-        return { left, right };
-      }
-    }
-  }
-  return null;
-}
-
-async function writeExclusiveJson(file, value) {
-  const handle = await fsp.open(file, 'wx');
-  try {
-    await handle.writeFile(JSON.stringify(value));
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-async function acquireRegistryMutex(token) {
-  await fsp.mkdir(LOCK_REGISTRY_DIRECTORY, { recursive: true });
-  const mutexPath = path.join(LOCK_REGISTRY_DIRECTORY, LOCK_REGISTRY_MUTEX);
-  const deadline = Date.now() + 5_000;
-  for (;;) {
+    if (!this.held) return [];
     try {
-      await writeExclusiveJson(mutexPath, { pid: process.pid, hostname: os.hostname(), token });
-      return mutexPath;
+      const owner = JSON.parse(fs.readFileSync(this.lockPath, 'utf8'));
+      if (owner.token === this.token) fs.unlinkSync(this.lockPath);
+      this.held = false;
+      return [];
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      if (await lockIsAbandoned(mutexPath) && await removeAbandonedLock(mutexPath)) continue;
-      if (Date.now() >= deadline) throw new Error('Timed out while coordinating backup directory locks.');
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (error.code === 'ENOENT') {
+        this.held = false;
+        return [];
+      }
+      return [{ path: this.lockPath, error }];
     }
   }
 }
 
-async function releaseOwnedLock(lockPath, token) {
-  try {
-    const owner = JSON.parse(await fsp.readFile(lockPath, 'utf8'));
-    if (owner.token === token) await fsp.unlink(lockPath);
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-}
-
-async function acquireRegistryClaim(plan, token) {
-  const mutexPath = await acquireRegistryMutex(token);
-  try {
-    const claims = lockClaims(plan);
-    const entries = await fsp.readdir(LOCK_REGISTRY_DIRECTORY, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      const claimPath = path.join(LOCK_REGISTRY_DIRECTORY, entry.name);
-      let owner;
-      try {
-        owner = JSON.parse(await fsp.readFile(claimPath, 'utf8'));
-      } catch (error) {
-        if (error.code === 'ENOENT') continue;
-        if (!(error instanceof SyntaxError)) throw error;
-      }
-      if (!owner || typeof owner.hostname !== 'string' || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
-        await fsp.rm(claimPath, { force: true });
-        continue;
-      }
-      if (owner.hostname === os.hostname() && !processIsRunning(owner.pid)) {
-        await fsp.rm(claimPath, { force: true });
-        continue;
-      }
-      const conflict = conflictingClaims(claims, Array.isArray(owner.claims) ? owner.claims : []);
-      if (conflict) {
-        throw new Error(
-          `Another backup run owns an overlapping directory: ${conflict.left.path} (${conflict.left.label}) ` +
-          `overlaps ${conflict.right.path} (${conflict.right.label}).`,
-        );
-      }
+function resolveRunLockPath(environment = process.env, homeDirectory = os.homedir()) {
+  if (environment.BACKUP_LOCK_PATH !== undefined) {
+    if (!path.isAbsolute(environment.BACKUP_LOCK_PATH)) {
+      throw new Error('BACKUP_LOCK_PATH must be an absolute path.');
     }
-    const claimPath = path.join(LOCK_REGISTRY_DIRECTORY, `${token}.json`);
-    await writeExclusiveJson(claimPath, { pid: process.pid, hostname: os.hostname(), token, claims });
-    return claimPath;
-  } finally {
-    await releaseOwnedLock(mutexPath, token);
+    return path.normalize(environment.BACKUP_LOCK_PATH);
   }
+  return path.join(homeDirectory, RUN_LOCK_FILENAME);
 }
 
-async function acquireDirectoryLocks(plan) {
-  const directories = new Map();
-  for (const directory of [plan.output, ...plan.targets]) directories.set(directory.identity, directory);
-  const ordered = [...directories.values()].sort((left, right) =>
-    comparablePath(left.canonicalPath).localeCompare(comparablePath(right.canonicalPath)));
+async function acquireRunLock(lockPath = resolveRunLockPath()) {
   const token = crypto.randomUUID();
-  const locks = new DirectoryLocks(new Set(), token);
-
+  const owner = { pid: process.pid, hostname: os.hostname(), token };
   try {
-    for (const directory of [plan.source, ...ordered].filter(Boolean)) await assertDirectoryUnchanged(directory);
-    locks.registryClaimPath = await acquireRegistryClaim(plan, token);
-    for (const directory of ordered) {
-      await assertDirectoryUnchanged(directory);
-      const lockPath = path.join(directory.canonicalPath, LOCK_FILENAME);
-      for (;;) {
-        let handle;
-        const metadataPath = shortTempPath(directory.canonicalPath, 'lock');
-        try {
-          handle = await fsp.open(metadataPath, 'wx');
-          await handle.writeFile(JSON.stringify({ pid: process.pid, hostname: os.hostname(), token }));
-          await handle.sync();
-          await handle.close();
-          handle = null;
-          await fsp.link(metadataPath, lockPath);
-          locks.locks.add(lockPath);
-          break;
-        } catch (error) {
-          if (handle) await handle.close().catch(() => {});
-          if (error.code !== 'EEXIST') throw error;
-          if (await lockIsAbandoned(lockPath) && await removeAbandonedLock(lockPath)) continue;
-          try {
-            await fsp.access(lockPath);
-          } catch (accessError) {
-            if (accessError.code === 'ENOENT') continue;
-            throw accessError;
-          }
-          throw new Error(`Another backup run owns ${directory.canonicalPath} (lock: ${lockPath}).`);
-        } finally {
-          await fsp.rm(metadataPath, { force: true }).catch(() => {});
-        }
-      }
-    }
-    return locks;
+    await fsp.writeFile(lockPath, JSON.stringify(owner), { flag: 'wx' });
+    return new RunLock(lockPath, token);
   } catch (error) {
-    await locks.release();
-    const releaseFailures = locks.releaseSync();
-    if (releaseFailures.length) {
-      error.message += ` Also failed to release ${releaseFailures.length} backup lock(s).`;
-    }
-    throw error;
+    if (error.code !== 'EEXIST') throw error;
+    throw new Error(
+      `Another backup run may already be active (lock: ${lockPath}). ` +
+      'If no backup is running, inspect and remove this stale lock manually.',
+    );
   }
+}
+
+/** @deprecated Backup runs now use one user-local singleton lock. */
+async function acquireDirectoryLocks(_plan) {
+  return acquireRunLock();
 }
 
 async function cleanupStartupArtifacts(plan) {
@@ -667,6 +593,7 @@ async function copyAtomically(source, target, context, dependencies = {}) {
 
 async function execute(plan, context, dependencies = {}) {
   const temporaryArchive = shortTempPath(plan.output.canonicalPath, 'archive');
+  const removeFile = dependencies.removeFile || fsp.rm;
   let replicationSource = temporaryArchive;
   try {
     context.throwIfInterrupted();
@@ -690,6 +617,7 @@ async function execute(plan, context, dependencies = {}) {
   }
 
   const copied = [];
+  let replicationFailure = null;
   try {
     for (const target of plan.copyTargets) {
       try {
@@ -703,10 +631,23 @@ async function execute(plan, context, dependencies = {}) {
       }
     }
     return copied;
+  } catch (error) {
+    replicationFailure = error;
+    throw error;
   } finally {
     if (!plan.retainArchive) {
-      await fsp.rm(temporaryArchive, { force: true });
-      context.untrack(temporaryArchive);
+      try {
+        await removeFile(temporaryArchive, { force: true });
+        context.untrack(temporaryArchive);
+      } catch (cleanupError) {
+        if (replicationFailure) {
+          replicationFailure.message += ` Cleanup also failed for ${temporaryArchive}: ${cleanupError.message}`;
+        } else {
+          cleanupError.message = `Failed to remove staging archive ${temporaryArchive}: ${cleanupError.message}`;
+          cleanupError.exitCode = EXIT.ARCHIVE;
+          throw cleanupError;
+        }
+      }
     }
   }
 }
@@ -733,7 +674,9 @@ async function main() {
   }
 
   let plan;
+  let lockPath;
   try {
+    lockPath = resolveRunLockPath();
     plan = await readAndValidate(path.resolve(argument));
     printPreview(plan);
   } catch (error) {
@@ -742,24 +685,24 @@ async function main() {
   }
 
   const context = new OperationContext();
-  let locks;
+  let runLock;
   const onSigint = () => { void context.interrupt('SIGINT'); };
   const onSigterm = () => { void context.interrupt('SIGTERM'); };
   const onExit = () => {
     context.cleanupSync();
-    locks?.releaseSync();
+    runLock?.releaseSync();
   };
   process.on('SIGINT', onSigint);
   process.on('SIGTERM', onSigterm);
   process.once('exit', onExit);
   try {
     if (!await confirmExecution(context)) {
-      console.log('Backup cancelled; no files were changed.');
+      console.log('\nCANCELLED — No files were changed.');
       return;
     }
     try {
       context.throwIfInterrupted();
-      locks = await acquireDirectoryLocks(plan);
+      runLock = await acquireRunLock(lockPath);
       context.throwIfInterrupted();
       await cleanupStartupArtifacts(plan);
       context.throwIfInterrupted();
@@ -768,10 +711,20 @@ async function main() {
       throw error;
     }
     const copied = await execute(plan, context);
-    console.log('Backup complete:');
-    if (plan.retainArchive) console.log(`  Archive: ${plan.archivePath}`);
-    else console.log(`  Staging archive removed from: ${plan.output.canonicalPath}`);
-    for (const destination of copied) console.log(`  Copy: ${destination}`);
+    console.log('\nBackup complete');
+    console.log('===============');
+    if (plan.retainArchive) {
+      console.log('');
+      console.log('Archive');
+      console.log(`${INDENT_PREFIX}${plan.archivePath}`);
+    } else {
+      console.log('');
+      console.log('Staging');
+      console.log(`${INDENT_PREFIX}Removed from ${plan.output.canonicalPath}`);
+    }
+    console.log('');
+    console.log(`Replicated copies (${copied.length})`);
+    copied.forEach((destination, index) => console.log(`${INDENT_PREFIX}${index + 1}. ${destination}`));
   } catch (error) {
     fail(error.message, error.exitCode || EXIT.ARCHIVE);
   } finally {
@@ -779,9 +732,9 @@ async function main() {
     process.removeListener('SIGTERM', onSigterm);
     reportCleanupRetries(await context.cleanup());
     reportCleanupFailures(context.cleanupSync());
-    if (locks) {
-      reportCleanupRetries(await locks.release());
-      reportCleanupFailures(locks.releaseSync());
+    if (runLock) {
+      reportCleanupRetries(await runLock.release());
+      reportCleanupFailures(runLock.releaseSync());
     }
     process.removeListener('exit', onExit);
   }
@@ -797,11 +750,16 @@ module.exports = {
   OperationContext,
   assertDirectoryUnchanged,
   backupFilename,
+  backupFilenamePattern,
   copyAtomically,
   cleanupStartupArtifacts,
   acquireDirectoryLocks,
+  acquireRunLock,
   createArchive,
   execute,
+  formatBytes,
+  measureDirectoryStorage,
   readAndValidate,
+  resolveRunLockPath,
   shortTempPath,
 };
